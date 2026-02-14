@@ -1,4 +1,32 @@
 # This file is used to generate synthetic language dataset
+"""
+Generate Simple Data
+====================
+
+This script is responsible for generating synthetic datasets for preference learning.
+It can optionally generate embeddings for the chosen and rejected responses using an LLM.
+
+Usage:
+    python -m hidden_context.data_utils.generate_simple_data \\
+        --output_dir data/simple_pets/ \\
+        --data_path data/relabeled_hh_rlhf \\
+        --with_embeddings True \\
+        --synthetic_dataset True \\
+        --model_type gpt2 \\
+        --data_subset helpful \\
+        --data_split train \\
+        --dataset_size 2000
+
+Arguments:
+    --output_dir: Directory where the generated dataset will be saved.
+    --data_path: Path to the original dataset (e.g., HH-RLHF).
+    --with_embeddings: Boolean, if True, generates embeddings for responses.
+    --synthetic_dataset: Boolean, if True, generates synthetic data (e.g., pets dataset).
+    --model_type: The LLM used for embedding generation (e.g., 'gpt2', 'llama').
+    --data_subset: Subset of data to use ('helpful', 'harmless').
+    --data_split: Split to use ('train', 'test').
+    --dataset_size: Number of examples to generate.
+"""
 from typing import cast
 
 from transformers import (
@@ -25,6 +53,20 @@ import numpy as np
 
 
 def generate_synthetic_dataset(args):
+    """
+    Generates a synthetic dataset (e.g., based on pet preferences) and optionally
+    prepares it for embedding generation.
+
+    The logic creates pairs of chosen/rejected responses based on predefined
+    sentences about pets (birds, dogs, cats, rabbits) and assigns preference
+    labels based on the 'pair_type'.
+
+    Args:
+        args: ScriptArguments containing dataset configuration.
+
+    Returns:
+        Dataset: A Hugging Face Dataset object containing the synthetic data.
+    """
     data_subset = cast(DataSubset, args.data_subset)
     input_dataset = get_hh_rlhf_dataset(
         data_subset,

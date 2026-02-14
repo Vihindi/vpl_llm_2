@@ -1,4 +1,27 @@
 import argparse
+"""
+UltraFeedback Augmentation
+==========================
+
+This script augments and filters the UltraFeedback dataset based on specific user types (personas).
+It joins the original UltraFeedback dataset with a binarized preference dataset.
+
+User Types (Personas):
+    Different "users" prioritize different metrics:
+    - Type '8' (1,0,0,0): Prioritizes Helpfulness
+    - Type '4' (0,1,0,0): Prioritizes Honesty
+    - Type '2' (0,0,1,0): Prioritizes Instruction Following
+    - Type '1' (0,0,0,1): Prioritizes Truthfulness
+
+Usage:
+    python -m hidden_context.data_utils.ultrafeedback_augment -a single -n P_4 -c
+
+Arguments:
+    -a, --augment_type: Strategy to augment data ('single', '84').
+    -c, --controversial_only: If set, filters for controversial pairs (where users disagree).
+    -n, --name: Suffix name for the dataset.
+    --seed: Random seed.
+"""
 import random
 
 import torch
@@ -9,18 +32,33 @@ import os
 
 def random_argmax(values):
     """ a random tie-breaking argmax """
+    """ a random tie-breaking argmax """
     return np.argmax(np.random.random(values.shape) * (values == values.max()))
 
 
 def random_greater_than_zero(values):
+    """Returns boolean array where values are > 0, breaking ties randomly for 0."""
     return (np.random.randn(values.shape[0]) * (values == 0) > 0.0) | (values > 0.0)
 
 
 def array_to_type(arr):
+    """Converts a binary array to a string representation of the user type integer."""
     return str(int(np.dot(arr, np.array([8, 4, 2, 1]))))
 
 
+
 def get_user_type(chosen_ratings, rejected_ratings, augment_type):
+    """
+    Determines user types and preference reversals based on ratings.
+    
+    Args:
+        chosen_ratings (dict): Ratings for the chosen response.
+        rejected_ratings (dict): Ratings for the rejected response.
+        augment_type (str): 'single' or '84'.
+        
+    Returns:
+        tuple: (data_subsets, reversed_labels, is_equal)
+    """
     keys = ['helpfulness', 'honesty', 'instruction_following', 'truthfulness']
     chosen_rating_values = list()
     rejected_rating_values = list()
@@ -41,6 +79,10 @@ def get_user_type(chosen_ratings, rejected_ratings, augment_type):
 
 
 def inner_join(original, binarized, augment_type, users, two_two_only=False, filter_equal=False):
+    """
+    Joins the original UltraFeedback dataset with the binarized version to align prompts and ratings.
+    It constructs a new dataset with specific user types and preference information.
+    """
     agreed_counter = 0
     controversial_counter = 0
     keys = ['helpfulness', 'honesty', 'instruction_following', 'truthfulness']

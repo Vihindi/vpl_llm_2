@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import random
 import torch.nn.functional as F  # noqa: N812
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset, Value
 from peft import LoraConfig, TaskType, get_peft_model
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
@@ -25,6 +25,17 @@ from typing_extensions import Literal, TypeAlias
 
 RewardModelType: TypeAlias = Literal["base", "mean_and_variance", "categorical"]
 DataSubset: TypeAlias = Literal["both", "helpful", "harmless"]
+
+"""
+[Baseline Models]
+This script trains standard Reward Models (non-VPL).
+It supports three types:
+1. 'base': Standard Scalar Reward Model (Bradley-Terry).
+2. 'mean_and_variance': Predicts a Gaussian distribution N(mu, sigma) for the reward.
+3. 'categorical': Predicts a categorical distribution over discrete reward bins.
+
+These serve as baselines to compare against the VAE-based VPL model.
+"""
 
 
 @dataclass
@@ -124,7 +135,7 @@ class ScriptArguments:
         metadata={"help": "Enables gradient checkpointing."},
     )
     optim: str = field(
-        default="adamw_hf",
+        default="adamw_torch", #### VPL peeps used adamw_hf
         metadata={"help": "The optimizer to use."},
     )
     lr_scheduler_type: str = field(
@@ -153,6 +164,20 @@ class HHRLHFPreprocessor(object):
         self.tokenizer_kwargs = tokenizer_kwargs
 
     def __call__(self, examples):
+        """
+        Example Input:
+            examples: Dict of lists
+            {
+                "chosen": ["Text A...", "Text B..."],
+                "rejected": ["Text C...", "Text D..."]
+            }
+        
+        Example Output:
+            {
+                "input_ids_chosen": [[101, ...], ...],
+                "input_ids_rejected": [[101, ...], ...]
+            }
+        """
         new_examples: dict = {
             "input_ids_chosen": [],
             "attention_mask_chosen": [],
@@ -195,6 +220,13 @@ class RewardTrainer(Trainer):
 
     @classmethod
     def per_sample_loss(cls, rewards_chosen, rewards_rejected):
+        """
+        [Standard Ranking Loss]
+        Loss = -log(sigmoid(r_chosen - r_rejected))
+        
+        This maximizes the probability that the chosen response has a higher score than the rejected one.
+        equivalent to the Bradley-Terry model.
+        """
         return -nn.functional.logsigmoid(rewards_chosen - rewards_rejected)
 
     def loss(self, rewards_chosen, rewards_rejected):
@@ -268,6 +300,21 @@ class MeanAndVarianceRewardTrainer(RewardTrainer):
 
     @classmethod
     def per_sample_loss(cls, rewards_chosen, rewards_rejected):
+        """
+        [Mean and Variance Loss]
+        Models the reward as a Gaussian distribution R ~ N(mu, sigma).
+        
+        The probability P(R_chosen > R_rejected) becomes P(N(mu_c - mu_r, sigma_c^2 + sigma_r^2) > 0).
+        This uses the CDF of the resulting Gaussian to compute the ranking probability.
+        """
+        """
+        Example Input:
+            rewards_chosen: (Batch, 2) -> [Mean, Log_Std] for Chosen
+            rewards_rejected: (Batch, 2) -> [Mean, Log_Std] for Rejected
+        
+        Example Output:
+            loss: (Batch,) - Gaussian CDF loss
+        """
         mean_chosen = rewards_chosen[:, 0]
         std_chosen = F.softplus(rewards_chosen[:, 1])
         mean_rejected = rewards_rejected[:, 0]
@@ -298,6 +345,21 @@ class CategoricalRewardTrainer(RewardTrainer):
 
     @classmethod
     def per_sample_loss(cls, rewards_chosen, rewards_rejected):
+        """
+        [Categorical Loss]
+        Models reward as a discrete distribution over bins (Atoms).
+        
+        Computes the probability that the chosen distribution stochastically dominates 
+        the rejected distribution.
+        """
+        """
+        Example Input:
+            rewards_chosen: (Batch, Num_Atoms) e.g. (32, 10) - Logits for each reward bin
+            rewards_rejected: (Batch, Num_Atoms) e.g. (32, 10)
+        
+        Example Output:
+            loss: (Batch,) - Probability that Chosen > Rejected
+        """
         num_atoms = rewards_chosen.size()[1]
         device = rewards_chosen.device
 
@@ -382,6 +444,50 @@ def get_hh_rlhf_dataset(
             subsets = ['8', '4', '2', '1']
         elif other_subsets == '84':
             subsets = ['8', '4']
+        elif other_subsets == 'custom_personas':
+            # Load custom persona datasets from grouped_data directory
+            # Expected structure: data_path/grouped_data/Persona_A/{train,test}.jsonl
+            # OR just data/grouped_data if data_path isn't pointing there.
+            
+            target_filename = "train.jsonl" if split == "train" else "test.jsonl"
+            
+            # Helper to load a specific file
+            def load_custom_file(persona_name, subset_name):
+                # Try constructing path assuming data_path is the base 'data' dir or similar
+                # We know our split script output to "data/grouped_data"
+                
+                # specific logic: if data_path contains "convoDrift", likely user points deep.
+                # simpler: check if "data/grouped_data" exists relative to CWD
+                
+                # Prioritize looking in data_path associated with the run (likely embedded data)
+                base_grouped_path = os.path.join(data_path, "grouped_data")
+                if not os.path.exists(base_grouped_path):
+                     # Fallback to default raw location
+                     base_grouped_path = os.path.join("data", "grouped_data")
+                
+                file_path = os.path.join(base_grouped_path, persona_name, target_filename)
+                
+                if os.path.exists(file_path):
+                    print(f"Loading custom dataset ({split}): {file_path}")
+                    ds = load_dataset("json", data_files=file_path, split="train") # json loader always calls it train unless mapped
+                    # Fix: consistency for concatenation
+                    if "Original_label" in ds.column_names:
+                        ds = ds.cast_column("Original_label", Value("int64"))
+                    # Add data_subset column
+                    return ds.map(lambda x: {"data_subset": subset_name})
+                else:
+                    print(f"Warning: Custom dataset file not found: {file_path}")
+                    return None
+
+            # Load Persona A
+            ds_a = load_custom_file("Persona_A", "Persona_A")
+            if ds_a: datasets.append(ds_a)
+            
+            # Load Persona B
+            ds_b = load_custom_file("Persona_B", "Persona_B")
+            if ds_b: datasets.append(ds_b)
+            
+            subsets = [] # Handled manually above
         else:
             subsets = []
         for subset in subsets:
@@ -489,7 +595,7 @@ if __name__ == "__main__":
         per_device_eval_batch_size=script_args.per_device_eval_batch_size,
         num_train_epochs=script_args.num_train_epochs,
         weight_decay=script_args.weight_decay,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=0.1,
         save_strategy="steps",
         save_steps=1000,
@@ -589,6 +695,18 @@ if __name__ == "__main__":
         return_tensors: str = "pt"
 
         def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+            """
+            Example Input:
+                features: List of dicts (len = Batch Size)
+                [ {"input_ids_chosen": ..., "input_ids_rejected": ...}, ... ]
+            
+            Example Output:
+                {
+                    "input_ids_chosen": (Batch, Max_Len),
+                    "input_ids_rejected": (Batch, Max_Len),
+                    ...
+                }
+            """
             features_chosen = []
             features_rejected = []
             for feature in features:

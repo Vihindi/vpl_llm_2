@@ -1,4 +1,17 @@
 # This file is used to preprocess dataset, available for any HH-RLHF format datasets
+"""
+Add Survey Contexts
+===================
+
+This script augments the dataset by adding survey questions and answers as context.
+It can optionally generate contexts from a pool of survey questions ('survey_dataset').
+
+The context selection mechanism tries to select a set of survey questions (and their answers)
+that are compatible with the target user (or controversial/ambiguous cases).
+
+Usage:
+    python -m hidden_context.data_utils.add_survey_contexts ... (args)
+"""
 import os
 from dataclasses import dataclass, field
 from typing import Optional, cast
@@ -119,6 +132,21 @@ class ScriptArguments:
 
 
 def generate_contexts(args, input_dataset, survey_dataset):
+    """
+    Augments the input dataset by adding a list of survey contexts for each example.
+
+    For each data point, it randomly selects a subset of survey questions (survey_dataset).
+    It ensures that the selected survey subset is consistent (e.g., satisfied by the same user subset).
+
+    Args:
+        args: ScriptArguments with configuration (e.g., survey_size, context_length).
+        input_dataset (Dataset): The main dataset to augment (e.g., HH-RLHF).
+        survey_dataset (Dataset): The pool of survey questions to sample from.
+
+    Returns:
+        Dataset: Augmented dataset with 'contexts' column.
+                 Output is also saved to jsonl file.
+    """
     # Generate context with survey question pool
     output_dir = os.path.join(args.output_dir, f"{args.model_type}", f"{args.data_subset}")
     if not os.path.exists(output_dir):
@@ -134,6 +162,20 @@ def generate_contexts(args, input_dataset, survey_dataset):
     dataset_list = list()
 
     def random_choice(max_context_length, survey_size):
+        """
+        Randomly selects a subset of the survey dataset to use as context.
+
+        It attempts to find a subset of survey questions that:
+        1. Has a size related to 'context_length'.
+        2. Is internally consistent (the intersection of satisfied user subsets is not empty or is specific).
+        
+        Args:
+            max_context_length (int): Maximum number of context items to include.
+            survey_size (int): Total size of the survey pool.
+            
+        Returns:
+            tuple: (chosen_dataset_subset, context_length)
+        """
         if max_context_length <= survey_size:
             from functools import reduce
             while True:
