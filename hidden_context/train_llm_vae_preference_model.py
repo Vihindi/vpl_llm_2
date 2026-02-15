@@ -148,6 +148,7 @@ class ScriptArguments:
     evaluation_strategy: str = field(default="steps", metadata={"help": "Evaluation strategy"})
     remove_unused_columns: bool = field(default=False, metadata={"help": "Remove unused columns"})
     max_length: int = field(default=1024)
+    eval_steps: int = field(default=100, metadata={"help": "Evaluation steps"})
     eval_first_step: bool = field(
         default=True,
         metadata={"help": "Whether to run eval after the first step"},
@@ -785,6 +786,13 @@ if __name__ == "__main__":
                          fixed_contexts=script_args.fixed_contexts,
                          fixed_llm_embeddings=script_args.fixed_llm_embeddings,)
 
+    # Calculate total steps for annealing
+    # From line 789 to 793 added by me
+    num_update_steps_per_epoch = len(train_dataset) // script_args.per_device_train_batch_size // script_args.gradient_accumulation_steps
+    total_steps = int(script_args.num_train_epochs * num_update_steps_per_epoch)
+    print(f"\\n[INFO] Dataset Size: {len(train_dataset)}")
+    print(f"[INFO] Total training steps calculated: {total_steps}")
+
     trainer = trainer_class(
         model=vae_model,
         args=training_args,
@@ -798,6 +806,7 @@ if __name__ == "__main__":
             pad_to_multiple_of=64,
         ),
         kl_loss_weight=script_args.kl_loss_weight,
+        total_steps=total_steps, # Added by me
         use_annealing=script_args.use_annealing,
         **trainer_kwargs,
     )

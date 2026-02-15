@@ -25,7 +25,7 @@ class PairEncoder(nn.Module):
         super(PairEncoder, self).__init__()
 
         self._model = nn.Sequential(
-            nn.Linear(4 * embed_dim, hidden_dim),
+            nn.Linear(2 * embed_dim, hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.2),
@@ -292,14 +292,15 @@ class VAETrainer(Trainer):
     Loss = Ranking Loss (reconstruction) + KL Divergence Loss
     """
     def __init__(
-        self, *args, lr_lambda=None, kl_loss_weight=None, use_annealing=False, **kwargs
+        # Added by me self, *args, lr_lambda=None, kl_loss_weight=None, use_annealing=False, **kwargs
+        self, *args, lr_lambda=None, kl_loss_weight=None, use_annealing=False, total_steps=10000, **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.lr_lambda = lr_lambda
         self.kl_loss_weight = kl_loss_weight
         self.use_annealing = use_annealing
         self.annealer = Annealer(
-            total_steps=1e4, shape="cosine", baseline=0.1, cyclical=True    # todo: change total_step here
+            total_steps=total_steps, shape="cosine", baseline=0.1, cyclical=True    # todo: change total_step here
         )
 
     @classmethod
