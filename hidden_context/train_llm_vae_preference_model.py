@@ -1,4 +1,19 @@
 import os
+import shutil
+import threading
+import time
+
+# # ── Redirect ALL Hugging Face cache to Google Drive ──────────────────────────
+# # Must happen BEFORE any `datasets` or `transformers` imports.
+# # `disable_caching()` alone does NOT stop load_dataset() from creating Arrow
+# # cache files; redirecting the cache dir to Drive avoids filling local disk.
+# _DRIVE_CACHE = "/content/drive/MyDrive/hf_cache"
+# os.makedirs(_DRIVE_CACHE, exist_ok=True)
+# os.environ.setdefault("HF_DATASETS_CACHE", _DRIVE_CACHE)
+# os.environ.setdefault("HF_HOME",           _DRIVE_CACHE)
+# os.environ.setdefault("TMPDIR",            _DRIVE_CACHE)
+# ─────────────────────────────────────────────────────────────────────────────
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Type, Union, cast
 
@@ -16,8 +31,6 @@ from transformers import (
 )
 from transformers.utils import PaddingStrategy
 from .vae_utils import VAETrainer, VAEModel
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
 
 from .train_llm_preference_model import (
     get_step_decay_lr_lambda,
@@ -27,10 +40,7 @@ from .train_llm_preference_model import (
     get_hh_rlhf_dataset,
     concatenate_datasets
 )
-from datasets import disable_progress_bar
-from datasets.utils.logging import set_verbosity_error
-set_verbosity_error()
-disable_progress_bar()
+
 
 
 @dataclass
@@ -47,10 +57,10 @@ class ScriptArguments:
                     "if the model that you want to train doesn't fit on a single GPU."
         },
     )
-    disable_tqdm: bool = field(
-        default=False,
-        metadata={"help": "Whether to disable tqdm progress bars"},
-    )
+    # checkpoint_path: Optional[str] = field(
+    #     default=None,
+    #     metadata={"help": "Explicit path to a checkpoint directory to resume from (overrides resume_from_checkpoint)."},
+    # )
     per_device_train_batch_size: int = field(default=2)
     per_device_eval_batch_size: int = field(default=1)
     gradient_accumulation_steps: int = field(default=1)
@@ -141,39 +151,22 @@ class ScriptArguments:
         default="cosine",
         metadata={"help": "The lr scheduler"},
     )
-    # Added to support user overrides
-    output_dir: str = field(default=None, metadata={"help": "Override output directory"})
-    logging_steps: int = field(default=100, metadata={"help": "Logging steps"})
-    save_strategy: str = field(default="steps", metadata={"help": "Save strategy"})
-    evaluation_strategy: str = field(default="steps", metadata={"help": "Evaluation strategy"})
-    remove_unused_columns: bool = field(default=False, metadata={"help": "Remove unused columns"})
     max_length: int = field(default=1024)
-    eval_steps: int = field(default=100, metadata={"help": "Evaluation steps"})
     eval_first_step: bool = field(
         default=True,
         metadata={"help": "Whether to run eval after the first step"},
     )
     log_dir: str = field(default="data/reward_models/hh_rlhf")
-    kl_loss_weight: float = field(default=0.0, metadata={"help": "weight for KLD loss"})
-    
-    # [VPL Paper Hyperparameters]
-    # latent_dim: Size of the user latent vector 'z'.
-    # hidden_dim: Size of internal layers in encoders/decoders.
-    # encoder_embed_dim / decoder_embed_dim: Dimensions of the LLM representations used as input.
+    kl_loss_weight: float = field(default=0.01, metadata={"help": "weight for KLD loss"})
     latent_dim: int = field(default=512, metadata={"help": "dimension of latent user vector"})    # todo: 64
     hidden_dim: int = field(default=512, metadata={"help": "dimension of hidden layer in vae"})    # todo: 256
     encoder_embed_dim: int = field(default=1024, metadata={"help": "dimension of LLM embeddings for encoder"})
     decoder_embed_dim: int = field(default=1024, metadata={"help": "dimension of LLM embeddings for decoder"})
     use_annealing: bool = field(default=True, metadata={"help": "Whether to use annealing for learning rate"})
-    
-    # fixed_contexts: If True, uses pre-computed embeddings for the context history C.
-    # This acts as the input to the VAE Encoder (SequenceEncoder).
     fixed_contexts: bool = field(
         default=False,
         metadata={"help": "whether to use pre-calculated embeddings for contexts (encoder inputs)"}
     )
-    # fixed_llm_embeddings: If True, uses pre-computed embeddings for the target query/response.
-    # This acts as the input to the VAE Decoder (Reward Model).
     fixed_llm_embeddings: bool = field(
         default=False,
         metadata={"help": "whether to use pre-calculated embeddings for decoder inputs"}
@@ -202,130 +195,96 @@ class ScriptArguments:
     )
 
 class HHRLHFPreprocessor(object):
-    """
-    [VPL Data Processing]
-    Responsible for structuring the inputs into:
-    1. Context C (user history): A list of previous interactions (chosen/rejected pairs).
-    2. Target (current interaction): The current chosen/rejected pair to be evaluated.
-    
-    This splits the raw dataset examples into the 'contexts' used by the Encoder 
-    and the 'targets' used by the Decoder.
-    """
     def __init__(self, args, tokenizer, **tokenizer_kwargs):
         self.tokenizer = tokenizer
         self.args = args
         self.tokenizer_kwargs = tokenizer_kwargs
 
     def __call__(self, examples):
-        """
-        Example Input:
-            examples: Dict of lists from Dataset
-            {
-                "chosen": ["Text A1...", "Text A2..."],
-                "rejected": ["Text B1...", "Text B2..."],
-                "contexts": [
-                    [{"chosen": "Hist1_A", "rejected": "Hist1_B"}, ...],  # User 1 history
-                    [{"chosen": "Hist2_A", "rejected": "Hist2_B"}, ...]   # User 2 history
-                ]
-            }
-        
-        Example Output:
-            new_examples: Dict of lists
-            {
-                "input_ids_chosen": [[101, ...], ...],  # Encoded Target Chosen
-                "contexts_tokens": [
-                   [ {"input_ids_chosen": ..., "input_ids_rejected": ...}, ... ], # Encoded History
-                   ...
-                ]
-            }
-        """
-        if self.args.fixed_llm_embeddings:
-            new_examples: dict = {
-                "embedding_chosen": [],
-                "embedding_rejected": [],
-                "contexts_embeddings": [],
-                "max_lengths": []
-            }
-            for embeddings, contexts in zip(
-                    examples["embeddings"], examples["contexts_embeddings"]
-            ):
-                new_examples["embedding_chosen"].append(embeddings["embedding_chosen"])
-                new_examples["embedding_rejected"].append(embeddings["embedding_rejected"])
-                contexts_embeddings = [{"embedding_chosen": context["embedding_chosen"],
-                                        "embedding_rejected": context["embedding_rejected"]}
-                                       for context in contexts]
-                new_examples["contexts_embeddings"].append(contexts_embeddings)
-                new_examples["max_lengths"].append(0)
-            new_examples["user_type"] = examples["data_subset"]
-            return new_examples
-
-        new_examples: dict = {
-            "input_ids_chosen": [],
-            "attention_mask_chosen": [],
-            "input_ids_rejected": [],
-            "attention_mask_rejected": [],
-            "max_lengths": []
-        }
-        if self.args.fixed_contexts:
-            new_examples["contexts_embeddings"] = []
-        else:
-            new_examples["contexts_tokens"] = []
-        for chosen, rejected, contexts, user_type in zip(
-                examples["chosen"], examples["rejected"], examples["contexts"], examples["data_subset"]
-        ):
-            max_length = 0
-            tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
-            tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
-            new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
-            new_examples["attention_mask_chosen"].append(
-                tokenized_chosen["attention_mask"]
-            )
-            new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
-            new_examples["attention_mask_rejected"].append(
-                tokenized_rejected["attention_mask"]
-            )
-            max_length = max(max_length, len(tokenized_chosen["input_ids"]))
-            max_length = max(max_length, len(tokenized_rejected["input_ids"]))
-
-            if self.args.fixed_contexts:
-                # DEBUG: Handle missing embeddings gracefully with logging
-                try:
+        try:
+            if self.args.fixed_llm_embeddings:
+                new_examples: dict = {
+                    "embedding_chosen": [],
+                    "embedding_rejected": [],
+                    "contexts_embeddings": [],
+                    "max_lengths": []
+                }
+                for embeddings, contexts in zip(
+                        examples["embeddings"], examples["contexts"]
+                ):
+                    new_examples["embedding_chosen"].append(embeddings["embedding_chosen"])
+                    new_examples["embedding_rejected"].append(embeddings["embedding_rejected"])
                     contexts_embeddings = [{"embedding_chosen": context["embedding_chosen"],
                                             "embedding_rejected": context["embedding_rejected"]}
                                            for context in contexts]
                     new_examples["contexts_embeddings"].append(contexts_embeddings)
-                except KeyError as e:
-                    print(f"\\n[ERROR] KeyError accessing context embeddings: {e}")
-                    if len(contexts) > 0:
-                        print(f"[DEBUG] Context keys present: {contexts[0].keys()}")
-                        if 'embeddings' in contexts[0]:
-                            print(f"[DEBUG] 'embeddings' content: {contexts[0]['embeddings']}")
-                        else:
-                            # Fallback if embeddings are nested differently or missing
-                            pass
-                    raise e
-            else:
-                tokenized_context = []
-                # Tokenize the contexts.
-                for context in contexts:
-                    chosen, rejected = context["chosen"], context["rejected"]
-                    tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
-                    tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
-                    tokenized_context.append(
-                        {
-                            "input_ids_chosen": tokenized_chosen["input_ids"],
-                            "attention_mask_chosen": tokenized_chosen["attention_mask"],
-                            "input_ids_rejected": tokenized_rejected["input_ids"],
-                            "attention_mask_rejected": tokenized_rejected["attention_mask"],
-                        }
-                    )
-                    max_length = max(max_length, len(tokenized_chosen["input_ids"]))
-                    max_length = max(max_length, len(tokenized_rejected["input_ids"]))
-                new_examples["contexts_tokens"].append(tokenized_context)
-            new_examples["max_lengths"].append(max_length)
-        new_examples["user_type"] = examples["data_subset"]
-        return new_examples
+                    new_examples["max_lengths"].append(0)
+                new_examples["user_type"] = examples["data_subset"]
+                return new_examples
 
+            new_examples: dict = {
+                "input_ids_chosen": [],
+                "attention_mask_chosen": [],
+                "input_ids_rejected": [],
+                "attention_mask_rejected": [],
+                "max_lengths": []
+            }
+            if self.args.fixed_contexts:
+                new_examples["contexts_embeddings"] = []
+            else:
+                new_examples["contexts_tokens"] = []
+            for chosen, rejected, contexts, user_type in zip(
+                    examples["chosen"], examples["rejected"], examples["contexts"], examples["data_subset"]
+            ):
+                max_length = 0
+                tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
+                tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
+                new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
+                new_examples["attention_mask_chosen"].append(
+                    tokenized_chosen["attention_mask"]
+                )
+                new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
+                new_examples["attention_mask_rejected"].append(
+                    tokenized_rejected["attention_mask"]
+                )
+                max_length = max(max_length, len(tokenized_chosen["input_ids"]))
+                max_length = max(max_length, len(tokenized_rejected["input_ids"]))
+
+                if self.args.fixed_contexts:
+                    contexts_embeddings = [{"embedding_chosen": context["embedding_chosen"],
+                                            "embedding_rejected": context["embedding_rejected"]}
+                                           for context in contexts]
+                    new_examples["contexts_embeddings"].append(contexts_embeddings)
+                else:
+                    tokenized_context = []
+                    # Tokenize the contexts.
+                    for context in contexts:
+                        chosen, rejected = context["chosen"], context["rejected"]
+                        tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
+                        tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
+                        tokenized_context.append(
+                            {
+                                "input_ids_chosen": tokenized_chosen["input_ids"],
+                                "attention_mask_chosen": tokenized_chosen["attention_mask"],
+                                "input_ids_rejected": tokenized_rejected["input_ids"],
+                                "attention_mask_rejected": tokenized_rejected["attention_mask"],
+                            }
+                        )
+                        max_length = max(max_length, len(tokenized_chosen["input_ids"]))
+                        max_length = max(max_length, len(tokenized_rejected["input_ids"]))
+                    new_examples["contexts_tokens"].append(tokenized_context)
+                new_examples["max_lengths"].append(max_length)
+            new_examples["user_type"] = examples["data_subset"]
+            return new_examples
+        except Exception as e:
+            import traceback
+            print(f"\n[PREPROCESSOR ERROR] {type(e).__name__}: {e}")
+            print(f"  Available keys in batch: {list(examples.keys())}")
+            print(f"  Sample chosen: {str(examples.get('chosen', ['N/A'])[0])[:200]}")
+            print(f"  Sample contexts type: {type(examples.get('contexts', [None])[0])}")
+            print(f"  Sample contexts value: {str(examples.get('contexts', [None])[0])[:300]}")
+            traceback.print_exc()
+            raise
 
 trainer_classes: Dict[RewardModelType, Type[VAETrainer]] = {
     "vae": VAETrainer,
@@ -335,15 +294,6 @@ trainer_classes: Dict[RewardModelType, Type[VAETrainer]] = {
 # We need to define a special data collator that batches the data in our j vs k format.
 @dataclass
 class RewardDataCollatorWithPadding:
-    """
-    [VPL Batching]
-    Handles the complexity of variable-length user contexts.
-    
-    Since each user context C has a different number of past interactions, this collator:
-    1. Flattens all context interactions from a batch of users into a single list.
-    2. Creates 'seq_start_end' indices so the SequenceEncoder knows which interactions belong to which user.
-       Format: [(start_idx_1, end_idx_1), (start_idx_2, end_idx_2), ...]
-    """
     args: ScriptArguments
     tokenizer: PreTrainedTokenizerBase
     padding: Union[bool, str, PaddingStrategy] = True
@@ -352,22 +302,6 @@ class RewardDataCollatorWithPadding:
     return_tensors: str = "pt"
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Example Input:
-            features: List of samples (Batch Size)
-            [
-                { "input_ids_chosen": ..., "contexts_tokens": [C1, C2] },
-                { "input_ids_chosen": ..., "contexts_tokens": [C3, C4, C5] }
-            ]
-        
-        Example Output:
-            batch: Dict of Tensors
-            {
-                "input_ids_chosen": (B, L_max),
-                "contexts_input_ids_chosen": (Sum_Contexts, L_max),  # Flattened history!
-                "seq_start_end": Tensor([[0, 2], [2, 5]])  # Validation of flattening
-            }
-        """
         if self.args.other_subsets is None:
             user_mapping = {
                 "helpful": 0,
@@ -378,10 +312,11 @@ class RewardDataCollatorWithPadding:
                 subsets = ['helpfulness', 'honesty', 'instruction_following', 'truthfulness']
             elif self.args.other_subsets == 'single' or self.args.other_subsets == '84':
                 subsets = ['8', '4', '2', '1']
-            elif self.args.other_subsets == 'custom_personas':
-                subsets = ['Persona_A', 'Persona_B']
+            elif self.args.other_subsets == 'grouped_personas':
+                subsets = ['Persona_A', 'Persona_B','Persona_C','Persona_D']
+            elif self.args.other_subsets == 'grouped_personas_2':
+                subsets = ['Persona_A', 'Persona_B']            
             else:
-                print("SEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE THEEEEEEEE SUBSET IS NULLLLLLLLLLLL")
                 subsets = []
             user_mapping = {subset: idx for idx, subset in enumerate(subsets)}
         if self.args.fixed_llm_embeddings:
@@ -579,16 +514,12 @@ class RewardDataCollatorWithPadding:
 
 def up_sample_controversial(dataset, seed):
     cont = dataset.filter(lambda example: example['controversial'] == True)
-    up_sampled_dataset = concatenate_datasets([cont] * 4 + [dataset])
+    up_sampled_dataset = concatenate_datasets([cont] * 2 + [dataset])
     up_sampled_dataset = up_sampled_dataset.shuffle(seed=seed)
     return up_sampled_dataset
 
 
 def customized_optimizer(model, lr):
-    """
-    [VPL Optimization Strategy]
-    Often beneficial to align the Encoders and Decoders at different rates.
-    """
     encoder_params = [p for p in model.parameters() if p not in model.decoder.parameters()]
     decoder_params = [p for p in model.parameters() if p in model.decoder.parameters()]
     grouped_parameters = [
@@ -596,6 +527,8 @@ def customized_optimizer(model, lr):
         {'params': decoder_params, 'lr': lr / 10},
     ]
     return
+
+
 
 
 if __name__ == "__main__":
@@ -617,10 +550,6 @@ if __name__ == "__main__":
         if script_args.model_name == 'meta-llama/Llama-2-7b-hf':
             script_args.decoder_embed_dim = 4096
             script_args.encoder_embed_dim = 4096
-        if script_args.model_name == 'meta-llama/Meta-Llama-3-8B-Instruct':
-            script_args.decoder_embed_dim = 4096
-            script_args.encoder_embed_dim = 4096
-            script_args.use_last_token_embedding = False
 
     data_subset = cast(DataSubset, script_args.data_subset)
     train_dataset = get_hh_rlhf_dataset(
@@ -670,8 +599,6 @@ if __name__ == "__main__":
     else:
         lr_scheduler_type = script_args.lr_scheduler_type
 
-    output_name = script_args.output_dir if script_args.output_dir else output_name
-
     training_args = TrainingArguments(
         output_dir=output_name,
         learning_rate=script_args.learning_rate,
@@ -679,25 +606,24 @@ if __name__ == "__main__":
         per_device_eval_batch_size=script_args.per_device_eval_batch_size,
         num_train_epochs=script_args.num_train_epochs,
         weight_decay=script_args.weight_decay,
-        eval_strategy=script_args.evaluation_strategy, # Updated
-        eval_steps=0.05 if script_args.evaluation_strategy == "steps" else None,
-        save_strategy=script_args.save_strategy, # Updated
-        save_steps=10000 if script_args.save_strategy == "steps" else None,
+        eval_strategy="steps",
+        eval_steps=0.05,
+        save_strategy="steps",
+        save_steps=10000,
         gradient_accumulation_steps=script_args.gradient_accumulation_steps,
         gradient_checkpointing=script_args.gradient_checkpointing,
         deepspeed=script_args.deepspeed,
         local_rank=script_args.local_rank,
-        remove_unused_columns=script_args.remove_unused_columns, # Updated
+        remove_unused_columns=False,
         label_names=[],
         bf16=script_args.bf16,
         fp16=script_args.fp16,
         logging_strategy="steps",
-        logging_steps=script_args.logging_steps, # Updated
+        logging_steps=100,
         optim=script_args.optim,
         lr_scheduler_type=lr_scheduler_type,
         report_to="wandb",
         run_name=output_name.split("/")[-1],
-        disable_tqdm=script_args.disable_tqdm,
     )
     # Load the value-head model and tokenizer.
     tokenizer_name = (
@@ -716,12 +642,6 @@ if __name__ == "__main__":
     )
 
     torch.set_anomaly_enabled(True)
-
-    trainer_classes = {
-        "base": VAETrainer,
-        "mean_and_variance": VAETrainer,
-        "categorical": VAETrainer,
-    }
 
     trainer_class = trainer_classes[reward_model_type]
     decoder_embed_dim = script_args.decoder_embed_dim
@@ -756,7 +676,7 @@ if __name__ == "__main__":
     tokenizer.padding_side = "right"
 
     model.config.use_cache = not script_args.gradient_checkpointing
-    num_proc = 24  # Can adjust to be higher if you have more processors.
+    num_proc = 1  # Can adjust to be higher if you have more processors.
     original_columns = train_dataset.column_names
 
     train_dataset = train_dataset.map(
@@ -764,6 +684,7 @@ if __name__ == "__main__":
         batched=True,
         num_proc=num_proc,
         remove_columns=original_columns,
+        keep_in_memory=True,
     )
     train_dataset = train_dataset.filter(
         lambda x: x["max_lengths"] <= script_args.max_length
@@ -774,6 +695,7 @@ if __name__ == "__main__":
         batched=True,
         num_proc=num_proc,
         remove_columns=original_columns,
+        keep_in_memory=True,
     )
     eval_dataset = eval_dataset.filter(
         lambda x: x["max_lengths"] <= script_args.max_length
@@ -785,13 +707,6 @@ if __name__ == "__main__":
     vae_model = VAEModel(encoder_embed_dim, decoder_embed_dim, hidden_dim, latent_dim, model, contexts_model,
                          fixed_contexts=script_args.fixed_contexts,
                          fixed_llm_embeddings=script_args.fixed_llm_embeddings,)
-
-    # Calculate total steps for annealing
-    # From line 789 to 793 added by me
-    num_update_steps_per_epoch = len(train_dataset) // script_args.per_device_train_batch_size // script_args.gradient_accumulation_steps
-    total_steps = int(script_args.num_train_epochs * num_update_steps_per_epoch)
-    print(f"\\n[INFO] Dataset Size: {len(train_dataset)}")
-    print(f"[INFO] Total training steps calculated: {total_steps}")
 
     trainer = trainer_class(
         model=vae_model,
@@ -806,136 +721,9 @@ if __name__ == "__main__":
             pad_to_multiple_of=64,
         ),
         kl_loss_weight=script_args.kl_loss_weight,
-        total_steps=total_steps, # Added by me
         use_annealing=script_args.use_annealing,
         **trainer_kwargs,
     )
-
-    def eval_pair_embeddings(model, eval_dataloader):
-        # We need to access the inner model if wrapped
-        if hasattr(model, "module"):
-            inner_model = model.module
-        else:
-            inner_model = model
-            
-        print("Visualizing Pair Embeddings...")
-        inner_model.eval()
-        pair_embeddings = []
-        labels = []
-        
-        # Limit the number of batches to avoid OOM or slow eval
-        max_batches = 100
-        
-        with torch.no_grad():
-            for i, batch in enumerate(eval_dataloader):
-                if i >= max_batches: break
-                
-                # Check if fixed_contexts or not to fetch embeddings
-                if script_args.fixed_contexts:
-                     # For fixed_contexts=True, collator outputs contexts_embeddings_chosen/rejected
-                     
-                     # Get device reliably
-                     device = next(inner_model.parameters()).device
-
-                     if "contexts_embeddings_chosen" in batch:
-                         c_c_raw = batch["contexts_embeddings_chosen"]
-                         c_r_raw = batch["contexts_embeddings_rejected"]
-                         
-                         # Manual tensor conversion if they are lists
-                         if isinstance(c_c_raw, list):
-                             c_c = torch.tensor(c_c_raw).to(device).float()
-                         else:
-                             c_c = c_c_raw.to(device).float()
-
-                         if isinstance(c_r_raw, list):
-                             c_r = torch.tensor(c_r_raw).to(device).float()
-                         else:
-                             c_r = c_r_raw.to(device).float()
-                     else:
-                         print("Warning: contexts_embeddings not found in batch for pair eval.")
-                         continue
-                else:
-                     # For fixed_contexts=False, we need to run context encoder first?
-                     # The current VAE architecture might be complex here.
-                     # Let's assume fixed_contexts=True for this visualization as per user config.
-                     print("Skipping pair eval for non-fixed contexts (not implemented yet).")
-                     return
-
-                # Pass through Pair Encoder
-                # pair_emb shape: (Sum_Contexts, Latent_Dim)
-                # We need to access the VAE model inside
-                if hasattr(inner_model, "vae_model"): 
-                     vae = inner_model.vae_model
-                elif isinstance(inner_model, VAEModel):
-                     vae = inner_model
-                elif hasattr(inner_model, "peft_config"): # PeftModel
-                     # PeftModel wraps the base model
-                     if hasattr(inner_model.base_model.model, "vae_model"):
-                        vae = inner_model.base_model.model.vae_model
-                     elif isinstance(inner_model.base_model.model, VAEModel):
-                        vae = inner_model.base_model.model
-                     else:
-                        print("Could not find VAE model inside PEFT wrapper")
-                        return
-                else:
-                     print(f"Could not find VAE model. Type: {type(inner_model)}")
-                     return
-                
-                try:
-                    pair_emb = vae.pair_encoder(c_c, c_r)
-                    pair_embeddings.append(pair_emb.cpu().numpy())
-                except Exception as e:
-                    print(f"Error in pair encoder forward: {e}")
-                    continue
-                
-                # Get labels for coloring
-                batch_user_types = batch["user_type"]
-                seq_start_end = batch["seq_start_end"]
-                
-                # batch['user_type'] is a list or tensor of user IDs for the *batch*
-                # seq_start_end maps batch indices to context ranges
-                # We need to replicate the user_type for each context in that range
-                
-                if isinstance(batch_user_types, torch.Tensor):
-                    batch_user_types = batch_user_types.cpu().numpy()
-                
-                for j, (start, end) in enumerate(seq_start_end):
-                    num_contexts = end - start
-                    u_type = batch_user_types[j]
-                    labels.extend([u_type] * num_contexts.item())
-
-        print(f"Collected {len(pair_embeddings)} pair embeddings for visualization.")
-        if len(pair_embeddings) == 0:
-            print("No pair embeddings collected.")
-            return
-
-        pair_embeddings = np.concatenate(pair_embeddings, axis=0)
-        labels = np.array(labels)
-
-        # Run t-SNE
-        if len(pair_embeddings) > 20:
-            try:
-                tsne = TSNE(n_components=2, random_state=42)
-                z_2d = tsne.fit_transform(pair_embeddings)
-                
-                fig, ax = plt.subplots(figsize=(10, 8))
-                scatter = ax.scatter(z_2d[:, 0], z_2d[:, 1], c=labels, cmap='tab10', alpha=0.6)
-                legend1 = ax.legend(*scatter.legend_elements(), title="Personas")
-                ax.add_artist(legend1)
-                plt.title("t-SNE of Pair Embeddings (Encoder Output)")
-                
-                # Save and log
-                plt.savefig("eval_pair_embeddings.png")
-                wandb.log({"eval_pair_embeddings": wandb.Image("eval_pair_embeddings.png")})
-                print("Logged eval_pair_embeddings to WandB")
-                plt.close()
-            except Exception as e:
-                print(f"t-SNE visualization failed: {e}")
-
-    class PairEmbeddingCallback(TrainerCallback):
-        def on_evaluate(self, args, state, control, model, eval_dataloader, **kwargs):
-            if state.global_step % args.logging_steps == 0 or state.global_step == 0:
-                 eval_pair_embeddings(model, eval_dataloader)
 
     class EvaluateFirstStepCallback(TrainerCallback):
         def on_step_begin(self, args, state, control, **kwargs):
@@ -944,8 +732,7 @@ if __name__ == "__main__":
 
 
     trainer.add_callback(EvaluateFirstStepCallback())
-    trainer.add_callback(PairEmbeddingCallback())
-
+    
     trainer.train(script_args.resume_from_checkpoint)
 
     print("Saving last checkpoint of the model")

@@ -18,7 +18,6 @@ from hidden_context.train_llm_preference_model import (
     DataSubset,
     get_hh_rlhf_dataset,
     concatenate_datasets,
-    HHRLHFPreprocessor,
 )
 
 from copy import deepcopy
@@ -57,6 +56,12 @@ class ScriptArguments:
             "help": "You can choose between 'gpt2', 'llama', or 'none'."
         }
     )
+    model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a local model directory or huggingface model name."
+        }
+    )
     embed_dim: int = field(
         default=1024,
         metadata={
@@ -83,51 +88,35 @@ class ScriptArguments:
     )
     other_subsets: str = field(default=None)
 
+class SimpleHHRLHFPreprocessor(object):
+    def __init__(self, tokenizer, **tokenizer_kwargs):
+        self.tokenizer = tokenizer
+        self.tokenizer_kwargs = tokenizer_kwargs
+
+    def __call__(self, examples):
+        new_examples: dict = {
+            "input_ids_chosen": [],
+            "attention_mask_chosen": [],
+            "input_ids_rejected": [],
+            "attention_mask_rejected": [],
+        }
+        for chosen, rejected in zip(examples["chosen"], examples["rejected"]):
+            tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
+            tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
+
+            new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
+            new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
+            new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
+            new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
+
+        return new_examples
 
 def generate_embeddings_with_llm(args, input_dataset=None):
     """
-    Generates fixed embeddings for 'chosen' and 'rejected' responses using an LLM.
-
-    This function:
-    1. Loads the specified LLM (GPT-2 or Llama).
-    2. Tokenizes the responses.
-    3. Runs a forward pass to get the last hidden state of the final token.
-    4. Adds these embeddings as a new column 'embeddings' to the dataset.
-
-    Args:
-        args: Script arguments containing model type, embedding dimension, etc.
-        input_dataset (Dataset, optional): The input dataset containing 'chosen' and 'rejected' text.
-                                           If None, it loads from args.data_path.
-
-    Returns:
-        Dataset: The dataset with an additional 'embeddings' column.
-                 Each entry in 'embeddings' is a dict:
-                 {
-                    'embedding_chosen': np.array(...),  # Shape: (embed_dim,)
-                    'embedding_rejected': np.array(...) # Shape: (embed_dim,)
-                 }
-
-    Example Input (row):
-        {
-            'prompt': 'Human: ...',
-            'chosen': 'Assistant: ...',
-            'rejected': 'Assistant: ...'
-        }
-
-    Example Output (row):
-        {
-            ...
-            'embeddings': {
-                'embedding_chosen': [0.12, -0.45, ...],
-                'embedding_rejected': [-0.01, 0.88, ...]
-            }
-        }
+    This function is used to generate fixed embeddings for inputs from original dataset.
     """
-    print("Before everything",input_dataset)
     if not args.synthetic_dataset:
-        print("IM INSIDE SYNTHETIC_DATASET")
         data_subset = cast(DataSubset, args.data_subset)
-        print("............ WHT IS DATA_SUBSET", data_subset)
         input_dataset = get_hh_rlhf_dataset(
             data_subset,
             args.data_split,
@@ -137,30 +126,32 @@ def generate_embeddings_with_llm(args, input_dataset=None):
             other_subsets=args.other_subsets,
         )
 
-    if "gpt2" in args.model_type:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_type, use_auth_token=True)
+    if args.model_type == "gpt2":
+        model_id = args.model_name_or_path if args.model_name_or_path else "gpt2"
+        tokenizer = AutoTokenizer.from_pretrained(model_id, use_auth_token=True)
         model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_type, num_labels=args.embed_dim, torch_dtype=torch.bfloat16
+            model_id, num_labels=args.embed_dim, torch_dtype=torch.bfloat16,
+            device_map="auto" #Added by me
         )
         model.score.weight.data *= 0.01
     elif args.model_type == "llama" or args.model_type == "meta-llama/Llama-2-7b-hf":
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", use_auth_token=True, add_eos_token=False)
+        model_id = args.model_name_or_path if args.model_name_or_path else "meta-llama/Llama-2-7b-hf"
+        tokenizer = AutoTokenizer.from_pretrained(model_id, use_auth_token=True, add_eos_token=False)
         model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-2-7b-hf", torch_dtype=torch.bfloat16
+            model_id, torch_dtype=torch.bfloat16,
+            device_map="auto" #Added by me
+
         )
-    elif args.model_type == "meta-llama/Meta-Llama-3-8B-Instruct":
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct", use_auth_token=True, add_eos_token=False)
+    elif args.model_type == "llama3" or args.model_type == "meta-llama/Meta-Llama-3-8B-Instruct":
+        model_id = args.model_name_or_path if args.model_name_or_path else "meta-llama/Meta-Llama-3-8B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_id, use_auth_token=True)
         model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Meta-Llama-3-8B-Instruct", torch_dtype=torch.bfloat16
+            model_id, torch_dtype=torch.bfloat16,
+            device_map="auto" #Added by me
         )
     else:
-        print(f"[WARNING] Model type '{args.model_type}' not recognized for embedding generation. Returning dataset without embeddings.")
-        print(f"[DEBUG] Supported types: 'gpt2' (substring), 'llama', 'meta-llama/Llama-2-7b-hf', 'meta-llama/Meta-Llama-3-8B-Instruct'")
         return input_dataset
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[INFO] Using device: {device}")
-    model.to(device)
+#    model.to("cuda") Removed by me
 
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -170,15 +161,13 @@ def generate_embeddings_with_llm(args, input_dataset=None):
     dataset_size = len(input_dataset)
     print(dataset_size)
 
-    print("AAAAAAAAAAAAAAAAA",input_dataset)
     preprocessed_dataset = input_dataset.map(
-        HHRLHFPreprocessor(tokenizer),
+        SimpleHHRLHFPreprocessor(tokenizer),
         batched=True,
         num_proc=24,
         remove_columns=input_dataset.column_names,
         load_from_cache_file=False,
     )
-    print("BBBBBBBBBBBBBBBB",preprocessed_dataset)
 
     input_dataset = input_dataset.filter(
         lambda example, idx: len(preprocessed_dataset[idx]["input_ids_chosen"]) <= args.max_length
@@ -197,58 +186,39 @@ def generate_embeddings_with_llm(args, input_dataset=None):
         emb = dict()
         for key in ['chosen', 'rejected']:
             tokens = tokenizer.pad(
-                {"input_ids": [preprocessed_dataset[row_id][f"input_ids_{key}"]] },
+                {"input_ids": preprocessed_dataset[row_id][f"input_ids_{key}"]},
                 padding=True, pad_to_multiple_of=64, return_tensors="pt"
             )
             token_length = len(preprocessed_dataset[row_id][f"input_ids_{key}"])
-            input_ids = tokens["input_ids"].to("cuda")
-            attention_mask = tokens["attention_mask"].to("cuda")
-
-            ## TODO: Commented this to find pair encoder issue. 
-            # with torch.no_grad():
-            #     last_hidden_state = model(
-            #         input_ids=input_ids,
-            #         attention_mask=attention_mask,
-            #         output_hidden_states=True
-            #     ).hidden_states[-1]
-            #     emb[f"embedding_{key}"] = last_hidden_state[0][token_length - 1].float().cpu().numpy()
-
+            input_ids = tokens["input_ids"].unsqueeze(0).to("cuda")
+            attention_mask = tokens["attention_mask"].unsqueeze(0).to("cuda")
             with torch.no_grad():
-                hs = model(
+                last_hidden_state = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     output_hidden_states=True
-                ).hidden_states[-1]  # [1, seq_len, dim]
+                ).hidden_states[-1]
+                emb[f"embedding_{key}"] = last_hidden_state[0][token_length - 1].float().cpu().numpy()
+            # with torch.no_grad():
+            #     hs = model(
+            #         input_ids=input_ids,
+            #         attention_mask=attention_mask,
+            #         output_hidden_states=True
+            #     ).hidden_states[-1]  # [1, seq_len, dim]
 
-                # masked mean pooling
-                mask = attention_mask.unsqueeze(-1).to(hs.dtype)  # [1, seq_len, 1]
-                summed = (hs * mask).sum(dim=1)                   # [1, dim]
-                denom = mask.sum(dim=1).clamp(min=1e-6)           # [1, 1]
-                pooled = (summed / denom).squeeze(0)              # [dim]
-                emb[f"embedding_{key}"] = pooled.float().cpu().numpy()
+            #     # masked mean pooling
+            #     mask = attention_mask.unsqueeze(-1).to(hs.dtype)  # [1, seq_len, 1]
+            #     summed = (hs * mask).sum(dim=1)                   # [1, dim]
+            #     denom = mask.sum(dim=1).clamp(min=1e-6)           # [1, 1]
+            #     pooled = (summed / denom).squeeze(0)              # [dim]
+            #     emb[f"embedding_{key}"] = pooled.float().cpu().numpy()
 
         embeddings.append(emb)
     output_dataset = input_dataset.add_column("embeddings", embeddings)
-    print("DDDDDDDDDDDDDDDDDDDDD",output_dataset)
     return output_dataset
 
 
 def generate_contexts(args, input_dataset):
-    """
-    Generates context for each data point by retrieving other examples from the dataset.
-    It can repeat samples K times and adds context information (original ID, chosen/rejected content or embeddings).
-
-    The function creates a 'contexts' column where each entry is a list of context dictionaries.
-    These contexts are randomly sampled from a 'controversial' subset of the data.
-
-    Args:
-        args: Script arguments containing output directory, synthetic dataset flag, etc.
-        input_dataset (Dataset): The input dataset with embeddings (if generated).
-
-    Returns:
-        Dataset: The dataset augmented with contexts and saved to JSONL.
-                 Also saves the output to: args.output_dir / args.model_type / args.data_subset / args.data_split.jsonl
-    """
     # Generate context without survey question pool
     output_dir = os.path.join(args.output_dir, f"{args.model_type}", f"{args.data_subset}")
     if not os.path.exists(output_dir):
@@ -269,6 +239,9 @@ def generate_contexts(args, input_dataset):
             row_contexts = list()
             num_context = 0
             controversial_subset = input_dataset.filter(lambda example: example['controversial'] == True)
+            if len(controversial_subset) == 0:
+                # [NEW] Fallback: use all data as candidates if no controversial items found
+                controversial_subset = input_dataset
             controversial_size = len(controversial_subset)
             while num_context < context_lengths[row_id]:
                 random_id = np.random.randint(controversial_size)

@@ -11,14 +11,6 @@ from transformers.optimization import get_cosine_schedule_with_warmup
 class PairEncoder(nn.Module):
     """
     Model to encode pairs of accepted and rejected responses
-    
-    [VPL Paper Concept]:
-    This component processes a single interaction from the User's Context set C.
-    An interaction consists of a prompt x, a chosen response y_w, and a rejected response y_l.
-    
-    In the paper, this corresponds to the initial processing of context elements before aggregation.
-    It maps the raw embeddings of the chosen and rejected responses (concatenated) into a 
-    hidden representation.
     """
 
     def __init__(self, embed_dim, hidden_dim, output_dim):
@@ -33,43 +25,13 @@ class PairEncoder(nn.Module):
         )
 
     def forward(self, e_c, e_r):
-        """
-        Example Input:
-            e_c: (Batch, Embed_Dim) e.g. (32, 1024) - Embedding of Chosen response
-            e_r: (Batch, Embed_Dim) e.g. (32, 1024) - Embedding of Rejected response
-        
-        Example Output:
-            output: (Batch, Hidden_Dim) e.g. (32, 512) - Encoded pair representation
-        """
-        # dtype = next(self._model.parameters()).dtype
-        # e_c = e_c.to(dtype)
-        # e_r = e_r.to(dtype)
-
-        # diff = e_c - e_r
-        # prod = e_c * e_r
-        # x = torch.cat([e_c, e_r, diff, prod], dim=1)
-        # return self._model(x)
-
         x = torch.cat([e_c, e_r], dim=1)
         return self._model(x)
-
 
 
 class SequenceEncoder(nn.Module):
     """
     Model to encode sequence of responses
-    
-    [VPL Paper Concept]:
-    This is the "Encoder" part of the Variational Autoencoder (VAE).
-    It takes the sequence of encoded interactions (from PairEncoder) constituting the user's context C.
-    
-    Role: Approximate the posterior distribution q_phi(z | C).
-    
-    Mechanism:
-    - Uses an attention mechanism (Self-Attention) to aggregate the variable-length sequence of 
-      interactions into a fixed-size representation.
-    - Outputs 'mean' (mu) and 'log_var' (log sigma^2) which parametrize the Gaussian distribution 
-      of the user's latent preference vector z.
     """
 
     def __init__(self, input_dim, latent_dim):
@@ -88,35 +50,6 @@ class SequenceEncoder(nn.Module):
     def forward(
         self, sequences, seq_start_end
     ):  # (C_1+C_2+...+C_n, D), [(0, C_1), (C_1, C_1+C_2), ..., (C_1+...+C_n-1, C_1+...+C_n)]
-        """
-        Example Input:
-            sequences: (Total_Context_Items, Input_Dim) e.g. (128, 512)
-                       - Aggregated interactions from ALL users in the batch.
-            seq_start_end: (Batch, 2) e.g. [(0, 4), (4, 10), ...]
-                           - Start and End indices for each user's context in 'sequences'.
-        
-        Example Output:
-            mean: (Batch, Latent_Dim) e.g. (32, 64)
-            log_var: (Batch, Latent_Dim) e.g. (32, 64)
-            
-        Sample Data Point (Batch Size = 2):
-        -----------------------------------
-        User A has 2 interactions (pairs) in history: [Pair_A1, Pair_A2]
-        User B has 1 interaction (pair) in history:   [Pair_B1]
-        
-        'sequences' input (Concatenated Contexts):
-        - Shape: (3, Input_Dim)
-        - Content: [Pair_A1_Embedding, 
-                    Pair_A2_Embedding, 
-                    Pair_B1_Embedding]
-        
-        'seq_start_end' input (Indices):
-        - Shape: (2, 2)
-        - Content: [
-             [0, 2],  # User A: sequences[0:2] -> {Pair_A1, Pair_A2}
-             [2, 3]   # User B: sequences[2:3] -> {Pair_B1}
-          ]
-        """
         outputs = []
         for _, (start, end) in enumerate(seq_start_end):
             context = sequences[start:end]  # C_i x D
@@ -134,29 +67,29 @@ class SequenceEncoder(nn.Module):
 
         mean = self.layer_norm(self.mean_layer(outputs))
         log_var = self.layer_norm(self.log_var_layer(outputs))
-        print("Here is the mean: ", mean)
-        print("Here is the log_var: ", log_var)
         return mean, log_var
 
 
 class Decoder(nn.Module):
-    """
-    [VPL Paper Concept]:
-    This is the "Decoder" or the "Reward Model" r_psi(x, y, z).
-    
-    Role: Predict the reward for a query-response pair (x, y), CONDITIONED on the latent user vector z.
-    
-    Inputs:
-    - xc/xr: Embeddings of the query-response pair (target being evaluated).
-    - z: The sampled latent user preference vector.
-    
-    This enables the personalization: the same input (x, y) can receive different rewards 
-    depending on the user's z.
-    
-    """
-
-    def __init__(self, input_dim, hidden_dim):
+    def __init__(self, input_dim, hidden_dim, latent_dim=512):
         super(Decoder, self).__init__()
+        
+        # --- OPTION 1: Old Concatenation Method (Commented Out) ---
+        # self._model = nn.Sequential(
+        #     nn.Linear(input_dim, hidden_dim),
+        #     nn.LeakyReLU(0.2),
+        #     nn.Linear(hidden_dim, hidden_dim),
+        #     nn.LeakyReLU(0.2),
+        #     nn.Linear(hidden_dim, 1),
+        # )
+
+        # --- OPTION 2: New FiLM Method (Feature-wise Linear Modulation) ---
+        # 1. The Volume Knobs (Gamma)
+        self.gamma_layer = nn.Linear(latent_dim, input_dim)
+        # 2. The Pitch Shifts (Beta)
+        self.beta_layer = nn.Linear(latent_dim, input_dim)
+        
+        # Note: input_dim is now just 4096 (not 4096 + 512) because we don't concatenate z anymore
         self._model = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LeakyReLU(0.2),
@@ -166,30 +99,34 @@ class Decoder(nn.Module):
         )
 
     def forward(self, xc, xr, z):
-        """
-        Example Input:
-            xc: (Batch, Embed_Dim) e.g. (32, 1024) - Target Chosen Embedding
-            xr: (Batch, Embed_Dim) e.g. (32, 1024) - Target Rejected Embedding
-            z: (Batch, Latent_Dim) e.g. (32, 64) - Latent User Vector
-        
-        Example Output:
-            rc: (Batch, 1) - Reward score for Chosen
-            rr: (Batch, 1) - Reward score for Rejected
-        """
-        print("Here is the  z: ", z)
-        xc = torch.cat([xc, z], dim=1)
-        xr = torch.cat([xr, z], dim=1)
-        rc = self._model(xc)
-        rr = self._model(xr)
+        # --- OPTION 1: Old Concatenation Method (Commented Out) ---
+        # xc = torch.cat([xc, z], dim=1)
+        # xr = torch.cat([xr, z], dim=1)
+        # rc = self._model(xc)
+        # rr = self._model(xr)
+
+        # --- OPTION 2: New FiLM Method ---
+        # 1. Generate the Equalizer settings from z
+        gamma = self.gamma_layer(z)
+        beta = self.beta_layer(z)
+
+        # 2. Multiply and Add (The active modulation)
+        # xc and xr are the text embeddings
+        xc_modulated = (gamma * xc) + beta
+        xr_modulated = (gamma * xr) + beta
+
+        # 3. Score the modulated embeddings
+        rc = self.score_forward(xc_modulated)
+        rr = self.score_forward(xr_modulated)
+
         return rc, rr
+
+    def score_forward(self, x):
+        # Helper to pass modulated text through the MLP
+        return self._model(x)
 
 
 class VAEModel(nn.Module):
-    """
-    [VPL Paper Concept]:
-    The sequence VPL model architecture implementing the flow:
-    Context C -> Encoder -> z ~ q(z|C) -> Decoder -> Reward r(x,y,z)
-    """
     def __init__(self, encoder_embed_dim, decoder_embed_dim, hidden_dim, latent_dim, llm_encoder, llm_contexts_encoder,
                  fixed_contexts=False, fixed_llm_embeddings=False, use_causal_lm=False, use_attention_layer=False,
                  use_transformer=False, concat_chosen_rejected=False):
@@ -198,7 +135,13 @@ class VAEModel(nn.Module):
         self.llm_contexts_encoder = llm_contexts_encoder
         self.pair_encoder = PairEncoder(encoder_embed_dim, hidden_dim, latent_dim)
         self.sequence_encoder = SequenceEncoder(latent_dim, latent_dim)
-        self.decoder = Decoder(decoder_embed_dim + latent_dim, hidden_dim)
+        # Fix for FiLM: Do not add latent_dim, because z is used for modulation, not appended.
+        # Option 1
+        # self.decoder = Decoder(decoder_embed_dim + latent_dim, hidden_dim)
+        # Option 2
+        self.decoder = Decoder(decoder_embed_dim, hidden_dim, latent_dim)
+
+
 
         self.latent_dim = latent_dim
         self.fixed_contexts = fixed_contexts
@@ -217,14 +160,6 @@ class VAEModel(nn.Module):
         z = F.normalize(z, p=2, dim=-1) * math.sqrt(z.shape[-1])
         return z
 
-    """
-    [VPL Paper Concept - Inference/Forward Pass]
-    1. Context Encoding: chosen/rejected pairs from context history are encoded (PairEncoder).
-    2. Latent Aggregation: SequenceEncoder computes mu and log_var.
-    3. Sampling: z is sampled using the Reparameterization Trick (during training).
-       z = mu + sigma * epsilon
-    4. Reward Prediction: The Decoder predicts rewards for the TARGET pair using z.
-    """
     def encode_pair(self, e_c, e_r):
         return self.pair_encoder(e_c, e_r)
 
@@ -243,21 +178,7 @@ class VAEModel(nn.Module):
         seq_start_end,
         user_type,
         ground_truth_user_vector=False,
-        **kwargs,
     ):
-        """
-        Example Input:
-            target_chosen: (Batch, Embed_Dim) - Current interaction chosen response
-            target_rejected: (Batch, Embed_Dim) - Current interaction rejected response
-            context_chosen: (Total_Context_Len, Embed_Dim) - History chosen responses
-            context_rejected: (Total_Context_Len, Embed_Dim) - History rejected responses
-            seq_start_end: (Batch, 2) - Indices map for context
-            user_type: (Batch,) - Optional user IDs (not used in standard training)
-        
-        Example Output:
-            rc, rr: (Batch, 1) - Rewards
-            mean, log_var, z: (Batch, Latent_Dim) - VAE internals
-        """
         pair_embed = self.encode_pair(context_chosen, context_rejected)
         mean, log_var = self.encode_sequence(pair_embed, seq_start_end)
         mean = torch.clamp(mean, -1, 1)
@@ -282,37 +203,19 @@ class VAEModel(nn.Module):
 
 
 class VAETrainer(Trainer):
-    """
-    [VPL Paper Concept]:
-    Handles the optimization of the Evidence Lower Bound (ELBO).
-    
-    Objective: maximize E_{z~q}[log p(y_w > y_l | x, z)] - beta * KL(q(z|C) || p(z))
-    
-    This translates to minimizing:
-    Loss = Ranking Loss (reconstruction) + KL Divergence Loss
-    """
     def __init__(
-        # Added by me self, *args, lr_lambda=None, kl_loss_weight=None, use_annealing=False, **kwargs
-        self, *args, lr_lambda=None, kl_loss_weight=None, use_annealing=False, total_steps=10000, **kwargs
+        self, *args, lr_lambda=None, kl_loss_weight=None, use_annealing=False, **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.lr_lambda = lr_lambda
         self.kl_loss_weight = kl_loss_weight
         self.use_annealing = use_annealing
         self.annealer = Annealer(
-            total_steps=total_steps, shape="cosine", baseline=0.1, cyclical=True    # todo: change total_step here
+            total_steps=1e4, shape="cosine", baseline=0.1, cyclical=True    # todo: change total_step here
         )
 
     @classmethod
     def per_sample_loss(cls, rewards_chosen, rewards_rejected):
-        """
-        Example Input:
-            rewards_chosen: (Batch, 1) e.g. [[0.8], [1.2]]
-            rewards_rejected: (Batch, 1) e.g. [[0.1], [1.5]]
-        
-        Example Output:
-            loss: (Batch, 1) - Per-sample ranking loss
-        """
         return -nn.functional.logsigmoid(rewards_chosen - rewards_rejected)
 
     def loss(self, rewards_chosen, rewards_rejected):
@@ -398,21 +301,8 @@ class VAETrainer(Trainer):
             seq_start_end,
             user_type,
             ground_truth_user_vector=False,  # todo: set to True for debug usage
-            # mask_chosen=inputs["attention_mask_chosen"],
-            # mask_rejected=inputs["attention_mask_rejected"],
         )
 
-        """
-        [VPL Paper Concept - Loss Calculation]
-        
-        reproduction_loss: The Ranking Loss.
-        - Corresponds to maximizing the likelihood of the preferred response given z.
-        - -log(sigmoid(reward_chosen - reward_rejected))
-        
-        kld: The KL Divergence term.
-        - Regularizes the learned posterior q(z|C) to be close to the prior p(z) (Standard Normal).
-        - Prevents overfitting to specific contexts and enforces a smooth latent space.
-        """
         reproduction_loss = self.loss(rewards_chosen, rewards_rejected)
         if self.kl_loss_weight == 0:
             loss = reproduction_loss
@@ -464,8 +354,6 @@ class VAETrainer(Trainer):
         return loss
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
-        if optimizer is None:
-            optimizer = self.optimizer
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=int(0.03 * num_training_steps),
@@ -486,6 +374,7 @@ class VAETrainer(Trainer):
         z = torch.from_numpy(z)
         loss = cls.per_sample_loss(rewards_chosen, rewards_rejected)
         kld = -torch.sum(1 + log_var - mean.pow(2) - log_var.exp(), dim=-1)
+        # kld = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp(), dim=-1)
         accuracy = torch.mean((loss < np.log(2)).float())
 
         def plot_latent(latent):
@@ -499,10 +388,12 @@ class VAETrainer(Trainer):
             return im
         im1 = plot_latent(mean)
         im2 = plot_latent(z)
-        
-        # Log images to wandb directly to avoid JSON serialization error in Trainer state saving
-        if wandb.run is not None:
-            wandb.log({"eval_mean_embeddings": im1, "eval_z_embeddings": im2})
+
+        try:
+            if wandb.run is not None:
+                wandb.log({"eval/mean_embeddings": im1, "eval/z_embeddings": im2}, commit=False)
+        except Exception:
+            pass
 
         return {
             "loss": loss.mean().item(),

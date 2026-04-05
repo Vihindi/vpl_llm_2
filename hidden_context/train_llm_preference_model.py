@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import random
 import torch.nn.functional as F  # noqa: N812
-from datasets import Dataset, concatenate_datasets, load_dataset, Value
+from datasets import Dataset, concatenate_datasets, load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
@@ -18,6 +18,7 @@ from transformers import (
     PreTrainedTokenizerBase,
     Trainer,
     TrainingArguments,
+    BitsAndBytesConfig,
 )
 from transformers.trainer_utils import EvalPrediction
 from transformers.utils import PaddingStrategy
@@ -25,17 +26,6 @@ from typing_extensions import Literal, TypeAlias
 
 RewardModelType: TypeAlias = Literal["base", "mean_and_variance", "categorical"]
 DataSubset: TypeAlias = Literal["both", "helpful", "harmless"]
-
-"""
-[Baseline Models]
-This script trains standard Reward Models (non-VPL).
-It supports three types:
-1. 'base': Standard Scalar Reward Model (Bradley-Terry).
-2. 'mean_and_variance': Predicts a Gaussian distribution N(mu, sigma) for the reward.
-3. 'categorical': Predicts a categorical distribution over discrete reward bins.
-
-These serve as baselines to compare against the VAE-based VPL model.
-"""
 
 
 @dataclass
@@ -135,7 +125,7 @@ class ScriptArguments:
         metadata={"help": "Enables gradient checkpointing."},
     )
     optim: str = field(
-        default="adamw_torch", #### VPL peeps used adamw_hf
+        default="adamw_torch",
         metadata={"help": "The optimizer to use."},
     )
     lr_scheduler_type: str = field(
@@ -156,28 +146,71 @@ class ScriptArguments:
         default=None,
         metadata={"help": "whether to only train and evaluate on one single user"}
     )
+    fixed_llm_embeddings: bool = field(
+        default=False,
+        metadata={"help": "whether to use pre-calculated embeddings for decoder inputs"}
+    )
+    decoder_embed_dim: int = field(
+        default=1024,
+        metadata={"help": "dimension of LLM embeddings for decoder"}
+    )
+
+
+class DummyConfig:
+    def __init__(self):
+        self.pad_token_id = None
+        self.use_cache = False
+        self.name_or_path = "simple_reward_model"
+        self.model_type = "simple"
+        
+    def to_dict(self):
+        return {
+            "pad_token_id": self.pad_token_id,
+            "use_cache": self.use_cache,
+            "name_or_path": self.name_or_path,
+            "model_type": self.model_type
+        }
+
+class SimpleRewardModel(nn.Module):
+    """
+    A lightweight wrapper that replaces AutoModelForSequenceClassification
+    when fixed_llm_embeddings is True. It only applies the final linear score head.
+    """
+    def __init__(self, embed_dim: int, num_labels: int):
+        super().__init__()
+        self.score = nn.Linear(embed_dim, num_labels, bias=False)
+        self.config = DummyConfig()
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+        
+    def forward(self, embeddings, attention_mask=None):
+        # embeddings shape: (batch_size, embed_dim)
+        # We output a tuple to match HuggingFace's sequence classification output
+        logits = self.score(embeddings)
+        return (logits,)
+
+
 
 
 class HHRLHFPreprocessor(object):
-    def __init__(self, tokenizer, **tokenizer_kwargs):
+    def __init__(self, args, tokenizer, **tokenizer_kwargs):
         self.tokenizer = tokenizer
         self.tokenizer_kwargs = tokenizer_kwargs
+        self.args = args
 
     def __call__(self, examples):
-        """
-        Example Input:
-            examples: Dict of lists
-            {
-                "chosen": ["Text A...", "Text B..."],
-                "rejected": ["Text C...", "Text D..."]
+        if self.args.fixed_llm_embeddings:
+            new_examples: dict = {
+                "embedding_chosen": [],
+                "embedding_rejected": [],
             }
-        
-        Example Output:
-            {
-                "input_ids_chosen": [[101, ...], ...],
-                "input_ids_rejected": [[101, ...], ...]
-            }
-        """
+            for embeddings in examples["embeddings"]:
+                new_examples["embedding_chosen"].append(embeddings["embedding_chosen"])
+                new_examples["embedding_rejected"].append(embeddings["embedding_rejected"])
+            return new_examples
+
         new_examples: dict = {
             "input_ids_chosen": [],
             "attention_mask_chosen": [],
@@ -220,35 +253,39 @@ class RewardTrainer(Trainer):
 
     @classmethod
     def per_sample_loss(cls, rewards_chosen, rewards_rejected):
-        """
-        [Standard Ranking Loss]
-        Loss = -log(sigmoid(r_chosen - r_rejected))
-        
-        This maximizes the probability that the chosen response has a higher score than the rejected one.
-        equivalent to the Bradley-Terry model.
-        """
         return -nn.functional.logsigmoid(rewards_chosen - rewards_rejected)
 
     def loss(self, rewards_chosen, rewards_rejected):
         return torch.mean(self.per_sample_loss(rewards_chosen, rewards_rejected))
 
-    def compute_loss(self, model, inputs, return_outputs=False):
-        all_rewards = model(
-            torch.concatenate(
-                [
-                    inputs["input_ids_chosen"],
-                    inputs["input_ids_rejected"],
-                ],
-                dim=0,
-            ),
-            torch.concatenate(
-                [
-                    inputs["attention_mask_chosen"],
-                    inputs["attention_mask_rejected"],
-                ],
-                dim=0,
-            ),
-        )[0]
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        if "embeddings_chosen" in inputs:
+            embeddings_chosen = torch.tensor(inputs["embeddings_chosen"]).to(model.device).bfloat16()
+            embeddings_rejected = torch.tensor(inputs["embeddings_rejected"]).to(model.device).bfloat16()
+            
+            # shape: (2 * batch_size, embed_dim)
+            combined_embeddings = torch.concatenate(
+                [embeddings_chosen, embeddings_rejected], dim=0
+            )
+            all_rewards = model(combined_embeddings)[0]
+        else:
+            all_rewards = model(
+                torch.concatenate(
+                    [
+                        inputs["input_ids_chosen"],
+                        inputs["input_ids_rejected"],
+                    ],
+                    dim=0,
+                ),
+                torch.concatenate(
+                    [
+                        inputs["attention_mask_chosen"],
+                        inputs["attention_mask_rejected"],
+                    ],
+                    dim=0,
+                ),
+            )[0]
+            
         all_rewards = all_rewards.reshape(2, -1, all_rewards.shape[-1])
         rewards_chosen = all_rewards[0]
         rewards_rejected = all_rewards[1]
@@ -300,21 +337,6 @@ class MeanAndVarianceRewardTrainer(RewardTrainer):
 
     @classmethod
     def per_sample_loss(cls, rewards_chosen, rewards_rejected):
-        """
-        [Mean and Variance Loss]
-        Models the reward as a Gaussian distribution R ~ N(mu, sigma).
-        
-        The probability P(R_chosen > R_rejected) becomes P(N(mu_c - mu_r, sigma_c^2 + sigma_r^2) > 0).
-        This uses the CDF of the resulting Gaussian to compute the ranking probability.
-        """
-        """
-        Example Input:
-            rewards_chosen: (Batch, 2) -> [Mean, Log_Std] for Chosen
-            rewards_rejected: (Batch, 2) -> [Mean, Log_Std] for Rejected
-        
-        Example Output:
-            loss: (Batch,) - Gaussian CDF loss
-        """
         mean_chosen = rewards_chosen[:, 0]
         std_chosen = F.softplus(rewards_chosen[:, 1])
         mean_rejected = rewards_rejected[:, 0]
@@ -345,21 +367,6 @@ class CategoricalRewardTrainer(RewardTrainer):
 
     @classmethod
     def per_sample_loss(cls, rewards_chosen, rewards_rejected):
-        """
-        [Categorical Loss]
-        Models reward as a discrete distribution over bins (Atoms).
-        
-        Computes the probability that the chosen distribution stochastically dominates 
-        the rejected distribution.
-        """
-        """
-        Example Input:
-            rewards_chosen: (Batch, Num_Atoms) e.g. (32, 10) - Logits for each reward bin
-            rewards_rejected: (Batch, Num_Atoms) e.g. (32, 10)
-        
-        Example Output:
-            loss: (Batch,) - Probability that Chosen > Rejected
-        """
         num_atoms = rewards_chosen.size()[1]
         device = rewards_chosen.device
 
@@ -444,50 +451,10 @@ def get_hh_rlhf_dataset(
             subsets = ['8', '4', '2', '1']
         elif other_subsets == '84':
             subsets = ['8', '4']
-        elif other_subsets == 'custom_personas':
-            # Load custom persona datasets from grouped_data directory
-            # Expected structure: data_path/grouped_data/Persona_A/{train,test}.jsonl
-            # OR just data/grouped_data if data_path isn't pointing there.
-            
-            target_filename = "train.jsonl" if split == "train" else "test.jsonl"
-            
-            # Helper to load a specific file
-            def load_custom_file(persona_name, subset_name):
-                # Try constructing path assuming data_path is the base 'data' dir or similar
-                # We know our split script output to "data/grouped_data"
-                
-                # specific logic: if data_path contains "convoDrift", likely user points deep.
-                # simpler: check if "data/grouped_data" exists relative to CWD
-                
-                # Prioritize looking in data_path associated with the run (likely embedded data)
-                base_grouped_path = os.path.join(data_path, "grouped_data")
-                if not os.path.exists(base_grouped_path):
-                     # Fallback to default raw location
-                     base_grouped_path = os.path.join("data", "grouped_data")
-                
-                file_path = os.path.join(base_grouped_path, persona_name, target_filename)
-                
-                if os.path.exists(file_path):
-                    print(f"Loading custom dataset ({split}): {file_path}")
-                    ds = load_dataset("json", data_files=file_path, split="train") # json loader always calls it train unless mapped
-                    # Fix: consistency for concatenation
-                    if "Original_label" in ds.column_names:
-                        ds = ds.cast_column("Original_label", Value("int64"))
-                    # Add data_subset column
-                    return ds.map(lambda x: {"data_subset": subset_name})
-                else:
-                    print(f"Warning: Custom dataset file not found: {file_path}")
-                    return None
-
-            # Load Persona A
-            ds_a = load_custom_file("Persona_A", "Persona_A")
-            if ds_a: datasets.append(ds_a)
-            
-            # Load Persona B
-            ds_b = load_custom_file("Persona_B", "Persona_B")
-            if ds_b: datasets.append(ds_b)
-            
-            subsets = [] # Handled manually above
+        elif other_subsets == 'grouped_personas':
+            subsets = ['Persona_A', 'Persona_B','Persona_C','Persona_D']
+        elif other_subsets == 'grouped_personas_2':
+            subsets = ['Persona_A', 'Persona_B']
         else:
             subsets = []
         for subset in subsets:
@@ -642,52 +609,60 @@ if __name__ == "__main__":
         num_labels = script_args.num_atoms
         trainer_kwargs["entropy_coeff"] = script_args.entropy_coeff
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        script_args.model_name, num_labels=num_labels, torch_dtype=torch.bfloat16
-    )
-    # We multiply the final linear layer's weights by 0.01 because this seems to
-    # significantly stabilize training and lead to better optimization of the loss.
-    model.score.weight.data *= 0.01
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
+    if script_args.fixed_llm_embeddings:
+        model = SimpleRewardModel(script_args.decoder_embed_dim, num_labels)
+        model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu")).bfloat16()
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            script_args.model_name, num_labels=num_labels, torch_dtype=torch.bfloat16
+        )
+        # We multiply the final linear layer's weights by 0.01 because this seems to
+        # significantly stabilize training and lead to better optimization of the loss.
+        model.score.weight.data *= 0.01
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
 
     # Need to do this for GPT2 and Llama because they doesn't have official pad tokens.
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-    model.config.pad_token_id = tokenizer.pad_token_id
-    tokenizer.padding_side = "right"
+    if not script_args.fixed_llm_embeddings:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        model.config.pad_token_id = tokenizer.pad_token_id
+        tokenizer.padding_side = "right"
+        model.config.use_cache = not script_args.gradient_checkpointing
 
-    model.config.use_cache = not script_args.gradient_checkpointing
     num_proc = 24  # Can adjust to be higher if you have more processors.
     original_columns = train_dataset.column_names
 
     train_dataset = train_dataset.map(
-        HHRLHFPreprocessor(tokenizer),
+        HHRLHFPreprocessor(script_args, tokenizer),
         batched=True,
         num_proc=num_proc,
         remove_columns=original_columns,
     )
-    train_dataset = train_dataset.filter(
-        lambda x: len(x["input_ids_chosen"]) <= script_args.max_length
-        and len(x["input_ids_rejected"]) <= script_args.max_length
-    )
+    if not script_args.fixed_llm_embeddings:
+        train_dataset = train_dataset.filter(
+            lambda x: len(x["input_ids_chosen"]) <= script_args.max_length
+            and len(x["input_ids_rejected"]) <= script_args.max_length
+        )
     print(len(train_dataset))
 
     eval_dataset = eval_dataset.map(
-        HHRLHFPreprocessor(tokenizer),
+        HHRLHFPreprocessor(script_args, tokenizer),
         batched=True,
         num_proc=num_proc,
         remove_columns=original_columns,
     )
-    eval_dataset = eval_dataset.filter(
-        lambda x: len(x["input_ids_chosen"]) <= script_args.max_length
-        and len(x["input_ids_rejected"]) <= script_args.max_length
-    )
+    if not script_args.fixed_llm_embeddings:
+        eval_dataset = eval_dataset.filter(
+            lambda x: len(x["input_ids_chosen"]) <= script_args.max_length
+            and len(x["input_ids_rejected"]) <= script_args.max_length
+        )
     print(len(eval_dataset))
 
     # We need to define a special data collator that batches the data in our j vs k format.
     @dataclass
     class RewardDataCollatorWithPadding:
+        args: ScriptArguments
         tokenizer: PreTrainedTokenizerBase
         padding: Union[bool, str, PaddingStrategy] = True
         max_length: Optional[int] = None
@@ -695,18 +670,18 @@ if __name__ == "__main__":
         return_tensors: str = "pt"
 
         def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-            """
-            Example Input:
-                features: List of dicts (len = Batch Size)
-                [ {"input_ids_chosen": ..., "input_ids_rejected": ...}, ... ]
-            
-            Example Output:
-                {
-                    "input_ids_chosen": (Batch, Max_Len),
-                    "input_ids_rejected": (Batch, Max_Len),
-                    ...
+            if self.args.fixed_llm_embeddings:
+                embeddings_chosen = []
+                embeddings_rejected = []
+                for feature in features:
+                    embeddings_chosen.append(feature["embedding_chosen"])
+                    embeddings_rejected.append(feature["embedding_rejected"])
+                return {
+                    "embeddings_chosen": embeddings_chosen,
+                    "embeddings_rejected": embeddings_rejected,
+                    "return_loss": True,
                 }
-            """
+
             features_chosen = []
             features_rejected = []
             for feature in features:
@@ -749,6 +724,7 @@ if __name__ == "__main__":
         eval_dataset=eval_dataset,
         compute_metrics=trainer_class.compute_metrics,
         data_collator=RewardDataCollatorWithPadding(
+            args=script_args,
             tokenizer=tokenizer,
             max_length=script_args.max_length,
             pad_to_multiple_of=64,
@@ -759,4 +735,9 @@ if __name__ == "__main__":
     trainer.train(script_args.resume_from_checkpoint)
 
     print("Saving last checkpoint of the model")
-    model.save_pretrained(output_name + "_peft_last_checkpoint")
+    if script_args.fixed_llm_embeddings:
+        import os
+        os.makedirs(output_name + "_last_checkpoint", exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(output_name + "_last_checkpoint", "pytorch_model.bin"))
+    else:
+        model.save_pretrained(output_name + "_peft_last_checkpoint")

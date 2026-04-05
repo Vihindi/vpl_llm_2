@@ -147,7 +147,6 @@ notebooks/
 .vscode/
 
 # output folder
-results/
 wandb/
 slurm*/
 data/

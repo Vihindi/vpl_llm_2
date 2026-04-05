@@ -1,17 +1,4 @@
 # This file is used to preprocess dataset, available for any HH-RLHF format datasets
-"""
-Add Survey Contexts
-===================
-
-This script augments the dataset by adding survey questions and answers as context.
-It can optionally generate contexts from a pool of survey questions ('survey_dataset').
-
-The context selection mechanism tries to select a set of survey questions (and their answers)
-that are compatible with the target user (or controversial/ambiguous cases).
-
-Usage:
-    python -m hidden_context.data_utils.add_survey_contexts ... (args)
-"""
 import os
 from dataclasses import dataclass, field
 from typing import Optional, cast
@@ -66,6 +53,12 @@ class ScriptArguments:
         default="none",
         metadata={
             "help": "You can choose between 'gpt2', 'llama', or 'none'."
+        }
+    )
+    model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a local model directory or huggingface model name."
         }
     )
     embed_dim: int = field(
@@ -132,21 +125,6 @@ class ScriptArguments:
 
 
 def generate_contexts(args, input_dataset, survey_dataset):
-    """
-    Augments the input dataset by adding a list of survey contexts for each example.
-
-    For each data point, it randomly selects a subset of survey questions (survey_dataset).
-    It ensures that the selected survey subset is consistent (e.g., satisfied by the same user subset).
-
-    Args:
-        args: ScriptArguments with configuration (e.g., survey_size, context_length).
-        input_dataset (Dataset): The main dataset to augment (e.g., HH-RLHF).
-        survey_dataset (Dataset): The pool of survey questions to sample from.
-
-    Returns:
-        Dataset: Augmented dataset with 'contexts' column.
-                 Output is also saved to jsonl file.
-    """
     # Generate context with survey question pool
     output_dir = os.path.join(args.output_dir, f"{args.model_type}", f"{args.data_subset}")
     if not os.path.exists(output_dir):
@@ -162,20 +140,6 @@ def generate_contexts(args, input_dataset, survey_dataset):
     dataset_list = list()
 
     def random_choice(max_context_length, survey_size):
-        """
-        Randomly selects a subset of the survey dataset to use as context.
-
-        It attempts to find a subset of survey questions that:
-        1. Has a size related to 'context_length'.
-        2. Is internally consistent (the intersection of satisfied user subsets is not empty or is specific).
-        
-        Args:
-            max_context_length (int): Maximum number of context items to include.
-            survey_size (int): Total size of the survey pool.
-            
-        Returns:
-            tuple: (chosen_dataset_subset, context_length)
-        """
         if max_context_length <= survey_size:
             from functools import reduce
             while True:
@@ -243,18 +207,54 @@ if __name__ == "__main__":
     torch.cuda.manual_seed(seed)
     parser = HfArgumentParser(ScriptArguments)
     script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
+    
+    # Handle boolean string arguments from bash script
+    if str(script_args.controversial_only).lower() == 'false':
+        script_args.controversial_only = False
+    elif str(script_args.controversial_only).lower() == 'true':
+        script_args.controversial_only = True
+        
+    if str(script_args.random_contexts).lower() == 'false':
+        script_args.random_contexts = False
+    elif str(script_args.random_contexts).lower() == 'true':
+        script_args.random_contexts = True
+        
     print(script_args)
+    
+
+    if os.environ.get("WANDB_MODE", "offline") == "online":
+        import wandb
+        wandb.init(project="vpl_embeddings", config=script_args, reinit=True)
+    
+        
     dataset = generate_embeddings_with_llm(script_args)
+
+    survey_output_dir = os.path.join(script_args.output_dir, f"{script_args.model_type}", f"{script_args.data_subset}")
+    if not os.path.exists(survey_output_dir):
+        os.makedirs(survey_output_dir)
+    survey_file_path = os.path.join(survey_output_dir, "survey_{}.jsonl".format(script_args.survey_size))
+
+    
     if not script_args.random_contexts:
-        survey_options = dataset.filter(lambda x: x['survey_options'] == True)
+        survey_options = dataset.filter(lambda x: x.get('survey_options', True) == True)
     else:
-        survey_options = dataset.filter(lambda x: x['survey_options'] == True or x['survey_options'] == False)
+        survey_options = dataset.filter(lambda x: x.get('survey_options', True) == True or x.get('survey_options', True) == False)
+    
     survey_ids = np.random.choice(range(len(survey_options)), script_args.survey_size, replace=False)
-    print(survey_ids)
+    print(f"Selected survey IDs: {survey_ids}")
+    
     if script_args.data_split == "train":
         survey_data = survey_options.filter(lambda example, idx: idx in survey_ids, with_indices=True)
-        survey_data.to_json(os.path.join(script_args.data_path, script_args.data_subset, "survey_{}.jsonl".format(script_args.survey_size)))
+        # REMOVED: survey_data.to_json(os.path.join(script_args.data_path, script_args.data_subset, "survey_{}.jsonl".format(script_args.survey_size)))
+        print(f"Saving survey data to: {survey_file_path}")
+        survey_data.to_json(survey_file_path)
     else:
-        survey_data = load_dataset('json', data_files=os.path.join(script_args.data_path, script_args.data_subset, "survey_{}.jsonl".format(script_args.survey_size)))
-        survey_data = survey_data['train']
+        # REMOVED: survey_data = load_dataset('json', data_files=os.path.join(script_args.data_path, script_args.data_subset, "survey_{}.jsonl".format(script_args.survey_size)))
+        print(f"Loading survey data from: {survey_file_path}")
+        if os.path.exists(survey_file_path):
+            survey_data = load_dataset('json', data_files=survey_file_path)
+            survey_data = survey_data['train']
+        else:
+            raise FileNotFoundError(f"Survey file not found at {survey_file_path}. Please run 'train' split first.")
+            
     generate_contexts(script_args, dataset, survey_data)

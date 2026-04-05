@@ -1,97 +1,87 @@
-## Personalizing Reinforcement Learning from Human Feedback with Variational Preference Learning
+# Adaptive Latent Persona Modelling Framework for LLMs
 
-####  [[Website]](https://weirdlabuw.github.io/vpl/) [[Paper]](https://arxiv.org/) 
+This repository contains the codebase for training, evaluating, and simulating Adaptive Latent Persona Modelling models using Large Language Models (LLMs). The core project focuses on learning dynamic, multi-persona user preferences and accurately modeling potential preference drift.
 
-[Sriyash Poddar<sup>1</sup>](https://sriya.sh), [Yanming Wan<sup>1</sup>](https://wanyanming.com/), [Hamish Ivison<sup>1</sup>](https://hamishivi.github.io/), [Abhishek Gupta<sup>1</sup>](https://homes.cs.washington.edu/~abhgupta), [Natasha Jaques<sup>1</sup>](https://natashajaques.ai)<br/>
+## Environment Setup
 
-<sup>1</sup>University of Washington
+Follow these steps to set up the codebase.
 
-This repo is an implementation of the language experiments of VPL. VPL is a variational framework for learning from human feedback (binary preference labels) i.e. inferring a novel user-specific latent and learning reward models and policies conditioned on this latent without additional user-specific data. This is used for quick adaptation to specific user preferences without retraining the entire model or ignoring underrepresented groups.
+1. **Navigate to the Project Directory**
+   Ensure you are in the root directory (`vpl_llm_2`).
+   ```bash
+   cd path/to/vpl_llm_2
+   ```
 
-For control experiments of VPL, please refer to [here](https://github.com/WEIRDLabUW/vpl).
+2. **Create a Virtual Environment (Optional but Recommended)**
+   ```bash
+   python -m venv .venv
+   # Activate on Windows:
+   .venv\Scripts\activate
+   # Activate on macOS/Linux:
+   source .venv/bin/activate
+   ```
 
-## Instructions
+3. **Install Dependencies**
+   Install the required Python modules via `requirements.txt`.
+   ```bash
+   pip install -r requirements.txt
+   ```
+   *(Note: Ensure you have compatible CUDA drivers if training on a GPU with `torch`.)*
 
+---
 
-#### Setting up repo
-```
-git clone git@github.com:WEIRDLabUW/vpl_llm.git
-```
+## Codebase Overview & Architecture
 
-#### Install Dependencies
-```
-conda create -n vpl python=3.10
-conda activate vpl
-pip install -r requirements.txt
-```
+### 1. Data Preparation
+- **`convert_user_data.py`**: Converts raw user-provided data fragments into proper HH-RLHF JSONL formats, standardizing prompt, chosen, and rejected mappings.
+- **`hidden_context/data_utils/add_survey_contexts.py`**: Pre-engineers datasets to inject contextual histories and invokes LLMs to generate high-dimensional embeddings for subsequent use.
+- **`run_generation.py`**: A batch utility wrapper that automates the execution of embedding generation commands efficiently across multiple personas and data splits.
 
-## Data and Pretrained models
+### 2. Training the Model
+- **`hidden_context/train_llm_vae_preference_model.py`**: The primary executable pipeline for training the VAE mechanism on underlying reward preferences. Employs Parameter-Efficient Fine-Tuning (PEFT, specifically LoRA) to train smoothly without excessive VRAM overheads.
+- **`hidden_context/train_llm_preference_model.py`**: Houses the fallback structural definitions and utilities utilized strictly by baseline (non-VAE) sequence reward models.
 
-Our datasets and checkpoints can be downloaded from [Google Drive link](https://drive.google.com/drive/folders/1dQ8zpNefRAtUB9TtbovOSn2MfV2Y-MbC?usp=sharing).
+### 3. Emulating Personas
+- **`create_multi_persona_simulation.py`**: Constructs intricate temporal simulations modeling "user drift." It pieces paired test cases successively starting from a reliable context segment ("Seed"), migrating through chaotic mixed boundaries ("Drift evaluation"), and lastly checking settling performance ("Final evaluation").
+- **`vae_session_inference.py`**: Contains the critical `VAESessionInference` class. It manages evaluating live reward scenarios continuously keeping track of a sliding window memory format, recalculating the inferred target user state (`z_anchor`).
 
-#### Datasets
-The datasets needed for VPL experiments should be downloaded and unzipped to ``./data/``. There are three datasets in the folder: ``simple_pets``, ``P_survey_100``, and ``P_4_survey_100``.
+### 4. Continuous Evaluation
+- **`evaluate_reward_scores.py`**: Calculates Tier-1 (Per-Persona Accuracy) and Tier-2 (Cross-Persona Latent Accuracy) metrics, ensuring that the latent distribution correctly encodes varying persona traits.
+- **`evaluate_adaptation_velocity.py`**: Generates tracking visualizations by comparing varying momentum variables over a temporal grid, determining precisely how fast the model adapts and restores accuracy subsequent to an unrecognized paradigm drift.
 
-#### Checkpoints
-The checkpoints for VPL experiments should be downloaded to ``./logs``. We provide the checkpoints for VPL and other baseline models over each dataset.
+---
 
-## Dataset Generation
-We also provide the code for generating our datasets. 
-The following scripts will also give you the datasets in ``./data/``.
-#### Pets
-To generate ``./data/simple_pets``, run
-```bash
-bash generate_llm_embeddings_pets.sh gpt2
-```
+## Basic Worflow Execution
 
-#### UF-P-2
-To generate ``./data/P_survey_100``, run
-```bash
-python -m hidden_context.data_utils.ultrafeedback_augment -a 84 -n P
-bash generate_llm_embeddings_UF_P_2.sh gpt2 84
-```
+1. **Format Base Datasets**  
+   Pre-format JSON configurations:
+   ```bash
+   python convert_user_data.py
+   ```
 
-#### UF-P-4
-To generate ``./data/P_4_survey_100``, run
-```bash
-python -m hidden_context.data_utils.ultrafeedback_augment -a single -n P_4 -c
-bash generate_llm_embeddings_UF_P_4.sh gpt2 single
-```
+2. **Generate Embeddings**  
+   Pre-compute contexts required for dynamic VAE loading:
+   ```bash
+   python run_generation.py
+   ```
 
-## Running Experiments
-In all the following scripts, ``<MODEL_TYPE>`` can be chosen from ``vae``, ``base``, ``categorical``, and ``mean_and_variance``. 
-``vae`` corresponds to our VPL models, while the others are training baseline models.
+3. **Train the Preference Model**  
+   Configure training inputs mapping local weights tracking inside the internal arguments structure:
+   ```bash
+   python -m hidden_context.train_llm_vae_preference_model \
+       --model_name <base_llm_name> \
+       --bf16 True 
+   # View the `ScriptArguments` dataclass inside the script for all parameters.
+   ```
 
-The results are recorded on Wandb. Please refer to ``eval/accuracy`` on Wandb page for model's performance.
+4. **Construct Sequential Evaluator Simulations**  
+   Map transitions between test personas (e.g. `Persona_A` transitioning to `Persona_B`):
+   ```bash
+   python create_multi_persona_simulation.py --all
+   ```
 
-#### Pets
-To train models on ``./data/simple_pets``, run
-```bash
-bash submit_job_pets.sh <MODEL_TYPE>
-```
-Note that the default settings are for Pets (full), 
-please change the arguments as explained in the bash file if you want to train on Pets (controversial).
-
-#### UF-P-2
-To train models on ``./data/P_survey_100``, run
-```bash
-bash submit_job_UF_P_2.sh <MODEL_TYPE>
-```
-
-#### UF-P-4
-To train models on ``./data/P_4_survey_100``, run
-```bash
-bash submit_job_UF_P_4.sh <MODEL_TYPE>
-```
-
-## Bibtex
-If you find this code useful, please cite:
-
-```
-@article{poddar2024vpl,
-    author    = {Poddar, Sriyash and Wan, Yanming and Ivision, Hamish and Gupta, Abhishek and Jaques, Natasha},
-    title     = {Personalizing Reinforcement Learning from Human Feedback with Variational Preference Learning},
-    booktitle = {ArXiv Preprint},
-    year      = {2024},
-}
-```
+5. **Examine Inference Adjustments**  
+   Trace adaptation velocities against baseline performances:
+   ```bash
+   python evaluate_adaptation_velocity.py --vae_model_path <path_to_saved_model>
+   ```
