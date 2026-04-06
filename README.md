@@ -2,6 +2,10 @@
 
 This repository contains the codebase for training, evaluating, and simulating Adaptive Latent Persona Modelling models using Large Language Models (LLMs). The core project focuses on learning dynamic, multi-persona user preferences and accurately modeling potential preference drift.
 
+## Dataset
+
+This framework utilizes the **convoDrift** dataset for modeling preference drift. The dataset is available at [https://github.com/Vihindi/_CONVODRIFT_.git](https://github.com/Vihindi/_CONVODRIFT_.git)
+
 ## Environment Setup
 
 Follow these steps to set up the codebase.
@@ -24,7 +28,6 @@ Follow these steps to set up the codebase.
    ```bash
    pip install -r requirements.txt
    ```
-   *(Note: Ensure you have compatible CUDA drivers if training on a GPU with `torch`.)*
 
 ---
 
