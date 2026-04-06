@@ -12,13 +12,11 @@ Follow these steps to set up the codebase.
    cd path/to/vpl_llm_2
    ```
 
-2. **Create a Virtual Environment **
+2. **Create a Virtual Environment**
    ```bash
    python -m venv .venv
    # Activate on Windows:
    .venv\Scripts\activate
-   # Activate on macOS/Linux:
-   source .venv/bin/activate
    ```
 
 3. **Install Dependencies**
